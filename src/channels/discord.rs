@@ -1,6 +1,7 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -13,7 +14,7 @@ pub struct DiscordChannel {
     listen_to_bots: bool,
     mention_only: bool,
     client: reqwest::Client,
-    typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DiscordChannel {
@@ -31,7 +32,7 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             client: reqwest::Client::new(),
-            typing_handle: std::sync::Mutex::new(None),
+            typing_handle: Mutex::new(None),
         }
     }
 
@@ -104,6 +105,43 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+fn mention_tags(bot_user_id: &str) -> [String; 2] {
+    [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
+}
+
+fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
+    let tags = mention_tags(bot_user_id);
+    content.contains(&tags[0]) || content.contains(&tags[1])
+}
+
+fn normalize_incoming_content(
+    content: &str,
+    mention_only: bool,
+    bot_user_id: &str,
+) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+
+    if mention_only && !contains_bot_mention(content, bot_user_id) {
+        return None;
+    }
+
+    let mut normalized = content.to_string();
+    if mention_only {
+        for tag in mention_tags(bot_user_id) {
+            normalized = normalized.replace(&tag, " ");
+        }
+    }
+
+    let normalized = normalized.trim().to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized)
+}
+
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
 #[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
@@ -148,11 +186,15 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
-    async fn send(&self, message: &str, channel_id: &str) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(message);
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let chunks = split_message_for_discord(&message.content);
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+            let url = format!(
+                "https://discord.com/api/v10/channels/{}/messages",
+                message.recipient
+            );
+
             let body = json!({ "content": chunk });
 
             let resp = self
@@ -342,32 +384,14 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    if content.is_empty() {
+                    let Some(clean_content) =
+                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                    else {
                         continue;
-                    }
-
-                    // Skip messages that don't @-mention the bot (when mention_only is enabled)
-                    if self.mention_only {
-                        let mention_tag = format!("<@{bot_user_id}>");
-                        if !content.contains(&mention_tag) {
-                            continue;
-                        }
-                    }
-
-                    // Strip the bot mention from content so the agent sees clean text
-                    let clean_content = if self.mention_only {
-                        let mention_tag = format!("<@{bot_user_id}>");
-                        content.replace(&mention_tag, "").trim().to_string()
-                    } else {
-                        content.to_string()
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d
-                        .get("channel_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -379,10 +403,10 @@ impl Channel for DiscordChannel {
                         reply_target: if channel_id.is_empty() {
                             author_id.to_string()
                         } else {
-                            channel_id
+                            channel_id.clone()
                         },
-                        content: content.to_string(),
-                        channel: "discord".to_string(),
+                        content: clean_content,
+                        channel: channel_id,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -428,18 +452,16 @@ impl Channel for DiscordChannel {
             }
         });
 
-        if let Ok(mut guard) = self.typing_handle.lock() {
-            *guard = Some(handle);
-        }
+        let mut guard = self.typing_handle.lock();
+        *guard = Some(handle);
 
         Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        if let Ok(mut guard) = self.typing_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        let mut guard = self.typing_handle.lock();
+        if let Some(handle) = guard.take() {
+            handle.abort();
         }
         Ok(())
     }
@@ -550,6 +572,31 @@ mod tests {
     fn bot_user_id_from_empty_token() {
         let id = DiscordChannel::bot_user_id_from_token("");
         assert_eq!(id, Some(String::new()));
+    }
+
+    #[test]
+    fn contains_bot_mention_supports_plain_and_nick_forms() {
+        assert!(contains_bot_mention("hi <@12345>", "12345"));
+        assert!(contains_bot_mention("hi <@!12345>", "12345"));
+        assert!(!contains_bot_mention("hi <@99999>", "12345"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_requires_mention_when_enabled() {
+        let cleaned = normalize_incoming_content("hello there", true, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_incoming_content_strips_mentions_and_trims() {
+        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("run status"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_rejects_empty_after_strip() {
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+        assert!(cleaned.is_none());
     }
 
     // Message splitting tests
@@ -674,7 +721,7 @@ mod tests {
 
     #[test]
     fn split_multibyte_only_content_without_panics() {
-        let msg = "你".repeat(2500);
+        let msg = "🦀".repeat(2500);
         let chunks = split_message_for_discord(&msg);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
@@ -704,7 +751,7 @@ mod tests {
     #[test]
     fn typing_handle_starts_as_none() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_none());
     }
 
@@ -712,7 +759,7 @@ mod tests {
     async fn start_typing_sets_handle() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_some());
     }
 
@@ -721,7 +768,7 @@ mod tests {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_none());
     }
 
@@ -737,7 +784,7 @@ mod tests {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_some());
     }
 

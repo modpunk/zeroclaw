@@ -1,4 +1,4 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, WhatsAppConfig};
+use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -7,6 +7,10 @@ use crate::config::{
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
+};
+use crate::providers::{
+    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
+    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -73,7 +77,7 @@ pub fn run_wizard() -> Result<Config> {
     let (workspace_dir, config_path) = setup_workspace()?;
 
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model) = setup_provider(&workspace_dir)?;
+    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
@@ -106,7 +110,7 @@ pub fn run_wizard() -> Result<Config> {
         } else {
             Some(api_key)
         },
-        api_url: None,
+        api_url: provider_api_url,
         default_provider: Some(provider),
         default_model: Some(model),
         default_temperature: 0.7,
@@ -147,6 +151,7 @@ pub fn run_wizard() -> Result<Config> {
     );
 
     config.save()?;
+    persist_workspace_selection(&config.config_path)?;
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -158,7 +163,8 @@ pub fn run_wizard() -> Result<Config> {
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some();
+        || config.channels_config.dingtalk.is_some()
+        || config.channels_config.qq.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -201,6 +207,7 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
     config.save()?;
+    persist_workspace_selection(&config.config_path)?;
 
     println!();
     println!(
@@ -215,7 +222,8 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some();
+        || config.channels_config.dingtalk.is_some()
+        || config.channels_config.qq.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -349,6 +357,7 @@ pub fn run_quick_setup(
     };
 
     config.save()?;
+    persist_workspace_selection(&config.config_path)?;
 
     // Scaffold minimal workspace files
     let default_ctx = ProjectContext {
@@ -444,6 +453,10 @@ pub fn run_quick_setup(
 }
 
 fn canonical_provider_name(provider_name: &str) -> &str {
+    if let Some(canonical) = canonical_china_provider_name(provider_name) {
+        return canonical;
+    }
+
     match provider_name {
         "grok" => "xai",
         "together" => "together-ai",
@@ -465,8 +478,9 @@ fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
-        "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
+        "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
+        "qwen" => "qwen-plus".into(),
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
@@ -677,7 +691,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Kimi Thinking Preview (deep reasoning)".to_string(),
             ),
         ],
-        "glm" | "zhipu" | "zai" | "z.ai" => vec![
+        "glm" | "zai" => vec![
             (
                 "glm-4.7".to_string(),
                 "GLM-4.7 (latest flagship)".to_string(),
@@ -700,6 +714,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "MiniMax-M2.1-lightning".to_string(),
                 "MiniMax M2.1 Lightning (fast)".to_string(),
+            ),
+        ],
+        "qwen" => vec![
+            (
+                "qwen-max".to_string(),
+                "Qwen Max (highest quality)".to_string(),
+            ),
+            (
+                "qwen-plus".to_string(),
+                "Qwen Plus (balanced default)".to_string(),
+            ),
+            (
+                "qwen-turbo".to_string(),
+                "Qwen Turbo (fast and cost-efficient)".to_string(),
             ),
         ],
         "ollama" => vec![
@@ -974,7 +1002,25 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
         )?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
-        "ollama" => fetch_ollama_models()?,
+        "ollama" => {
+            if api_key.as_deref().map_or(true, |k| k.trim().is_empty()) {
+                // Key is None or empty, assume local Ollama
+                fetch_ollama_models()?
+            } else {
+                // Key is present, assume Ollama Cloud and return hardcoded list
+                vec![
+                    "glm-5:cloud".to_string(),
+                    "glm-4.7:cloud".to_string(),
+                    "gpt-oss:cloud".to_string(),
+                    "gemini-3-flash-preview:cloud".to_string(),
+                    "qwen2.5-coder:1.5b".to_string(),
+                    "qwen2.5-coder:3b".to_string(),
+                    "qwen2.5:cloud".to_string(),
+                    "minimax-m2.5:cloud".to_string(),
+                    "deepseek-v3.1:cloud".to_string(),
+                ]
+            }
+        }
         _ => Vec::new(),
     };
 
@@ -1255,6 +1301,18 @@ fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
+fn persist_workspace_selection(config_path: &Path) -> Result<()> {
+    let config_dir = config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    crate::config::schema::persist_active_workspace_config_dir(config_dir).with_context(|| {
+        format!(
+            "Failed to persist active workspace selection for {}",
+            config_dir.display()
+        )
+    })
+}
+
 // ── Step 1: Workspace ────────────────────────────────────────────
 
 fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
@@ -1300,13 +1358,13 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
+fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
         "🏠 Local / private (Ollama — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
@@ -1344,14 +1402,31 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         2 => vec![
             ("vercel", "Vercel AI Gateway"),
             ("cloudflare", "Cloudflare AI Gateway"),
+            (
+                "astrai",
+                "Astrai — compliant AI routing (PII stripping, cost optimization)",
+            ),
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
-            ("moonshot", "Moonshot — Kimi & Kimi Coding"),
-            ("glm", "GLM — ChatGLM / Zhipu models"),
-            ("minimax", "MiniMax — MiniMax AI models"),
-            ("qianfan", "Qianfan — Baidu AI models"),
-            ("zai", "Z.AI — Z.AI inference"),
+            ("moonshot", "Moonshot — Kimi API (China endpoint)"),
+            (
+                "moonshot-intl",
+                "Moonshot — Kimi API (international endpoint)",
+            ),
+            ("glm", "GLM — ChatGLM / Zhipu (international endpoint)"),
+            ("glm-cn", "GLM — ChatGLM / Zhipu (China endpoint)"),
+            (
+                "minimax",
+                "MiniMax — international endpoint (api.minimax.io)",
+            ),
+            ("minimax-cn", "MiniMax — China endpoint (api.minimaxi.com)"),
+            ("qwen", "Qwen — DashScope China endpoint"),
+            ("qwen-intl", "Qwen — DashScope international endpoint"),
+            ("qwen-us", "Qwen — DashScope US endpoint"),
+            ("qianfan", "Qianfan — Baidu AI models (China endpoint)"),
+            ("zai", "Z.AI — global coding endpoint"),
+            ("zai-cn", "Z.AI — China coding endpoint (open.bigmodel.cn)"),
             ("synthetic", "Synthetic — Synthetic AI models"),
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
@@ -1400,7 +1475,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             style(&model).green()
         );
 
-        return Ok((provider_name, api_key, model));
+        return Ok((provider_name, api_key, model, None));
     }
 
     let provider_labels: Vec<&str> = providers.iter().map(|(_, label)| *label).collect();
@@ -1413,10 +1488,53 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
 
     let provider_name = providers[provider_idx].0;
 
-    // ── API key ──
+    // ── API key / endpoint ──
+    let mut provider_api_url: Option<String> = None;
     let api_key = if provider_name == "ollama" {
-        print_bullet("Ollama runs locally — no API key needed!");
-        String::new()
+        let use_remote_ollama = Confirm::new()
+            .with_prompt("  Use a remote Ollama endpoint (for example Ollama Cloud)?")
+            .default(false)
+            .interact()?;
+
+        if use_remote_ollama {
+            let raw_url: String = Input::new()
+                .with_prompt("  Remote Ollama endpoint URL")
+                .default("https://ollama.com".into())
+                .interact_text()?;
+
+            let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+            if normalized_url.is_empty() {
+                anyhow::bail!("Remote Ollama endpoint URL cannot be empty.");
+            }
+
+            provider_api_url = Some(normalized_url.clone());
+
+            print_bullet(&format!(
+                "Remote endpoint configured: {}",
+                style(&normalized_url).cyan()
+            ));
+            print_bullet(&format!(
+                "If you use cloud-only models, append {} to the model ID.",
+                style(":cloud").yellow()
+            ));
+
+            let key: String = Input::new()
+                .with_prompt("  API key for remote Ollama endpoint (or Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            if key.trim().is_empty() {
+                print_bullet(&format!(
+                    "No API key provided. Set {} later if required by your endpoint.",
+                    style("OLLAMA_API_KEY").yellow()
+                ));
+            }
+
+            key
+        } else {
+            print_bullet("Using local Ollama at http://localhost:11434 (no API key needed).");
+            String::new()
+        }
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -1500,28 +1618,38 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             key
         }
     } else {
-        let key_url = match provider_name {
-            "openrouter" => "https://openrouter.ai/keys",
-            "openai" => "https://platform.openai.com/api-keys",
-            "venice" => "https://venice.ai/settings/api",
-            "groq" => "https://console.groq.com/keys",
-            "mistral" => "https://console.mistral.ai/api-keys",
-            "deepseek" => "https://platform.deepseek.com/api_keys",
-            "together-ai" => "https://api.together.xyz/settings/api-keys",
-            "fireworks" => "https://fireworks.ai/account/api-keys",
-            "perplexity" => "https://www.perplexity.ai/settings/api",
-            "xai" => "https://console.x.ai",
-            "cohere" => "https://dashboard.cohere.com/api-keys",
-            "moonshot" => "https://platform.moonshot.cn/console/api-keys",
-            "glm" | "zhipu" => "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys",
-            "zai" | "z.ai" => "https://platform.z.ai/",
-            "minimax" => "https://www.minimaxi.com/user-center/basic-information",
-            "vercel" => "https://vercel.com/account/tokens",
-            "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
-            "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
-            "bedrock" => "https://console.aws.amazon.com/iam",
-            "gemini" => "https://aistudio.google.com/app/apikey",
-            _ => "",
+        let key_url = if is_moonshot_alias(provider_name) {
+            "https://platform.moonshot.cn/console/api-keys"
+        } else if is_glm_cn_alias(provider_name) || is_zai_cn_alias(provider_name) {
+            "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
+        } else if is_glm_alias(provider_name) || is_zai_alias(provider_name) {
+            "https://platform.z.ai/"
+        } else if is_minimax_alias(provider_name) {
+            "https://www.minimaxi.com/user-center/basic-information"
+        } else if is_qwen_alias(provider_name) {
+            "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
+        } else if is_qianfan_alias(provider_name) {
+            "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78"
+        } else {
+            match provider_name {
+                "openrouter" => "https://openrouter.ai/keys",
+                "openai" => "https://platform.openai.com/api-keys",
+                "venice" => "https://venice.ai/settings/api",
+                "groq" => "https://console.groq.com/keys",
+                "mistral" => "https://console.mistral.ai/api-keys",
+                "deepseek" => "https://platform.deepseek.com/api_keys",
+                "together-ai" => "https://api.together.xyz/settings/api-keys",
+                "fireworks" => "https://fireworks.ai/account/api-keys",
+                "perplexity" => "https://www.perplexity.ai/settings/api",
+                "xai" => "https://console.x.ai",
+                "cohere" => "https://dashboard.cohere.com/api-keys",
+                "vercel" => "https://vercel.com/account/tokens",
+                "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
+                "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
+                "bedrock" => "https://console.aws.amazon.com/iam",
+                "gemini" => "https://aistudio.google.com/app/apikey",
+                _ => "",
+            }
         };
 
         println!();
@@ -1551,7 +1679,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
     };
 
     // ── Model selection ──
-    let models: Vec<(&str, &str)> = match provider_name {
+    let canonical_provider = canonical_provider_name(provider_name);
+    let models: Vec<(&str, &str)> = match canonical_provider {
         "openrouter" => vec![
             (
                 "anthropic/claude-sonnet-4",
@@ -1629,7 +1758,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
                 "Mixtral 8x22B",
             ),
         ],
-        "together" => vec![
+        "together-ai" => vec![
             (
                 "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
                 "Llama 3.1 70B Turbo",
@@ -1654,12 +1783,17 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             ("moonshot-v1-128k", "Moonshot V1 128K"),
             ("moonshot-v1-32k", "Moonshot V1 32K"),
         ],
-        "glm" | "zhipu" | "zai" | "z.ai" => vec![
+        "glm" | "zai" => vec![
             ("glm-5", "GLM-5 (latest)"),
             ("glm-4-plus", "GLM-4 Plus (flagship)"),
             ("glm-4-flash", "GLM-4 Flash (fast)"),
         ],
         "minimax" => MINIMAX_ONBOARD_MODELS.to_vec(),
+        "qwen" => vec![
+            ("qwen-plus", "Qwen Plus (balanced default)"),
+            ("qwen-max", "Qwen Max (highest quality)"),
+            ("qwen-turbo", "Qwen Turbo (fast and cost-efficient)"),
+        ],
         "ollama" => vec![
             ("llama3.2", "Llama 3.2 (recommended local)"),
             ("mistral", "Mistral 7B"),
@@ -1840,7 +1974,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         style(&model).green()
     );
 
-    Ok((provider_name.to_string(), api_key, model))
+    Ok((provider_name.to_string(), api_key, model, provider_api_url))
 }
 
 /// Map provider name to its conventional env var
@@ -1849,6 +1983,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
+        "ollama" => "OLLAMA_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -1858,11 +1993,12 @@ fn provider_env_var(name: &str) -> &'static str {
         "fireworks" | "fireworks-ai" => "FIREWORKS_API_KEY",
         "perplexity" => "PERPLEXITY_API_KEY",
         "cohere" => "COHERE_API_KEY",
-        "moonshot" | "kimi" => "MOONSHOT_API_KEY",
-        "glm" | "zhipu" => "GLM_API_KEY",
+        "moonshot" => "MOONSHOT_API_KEY",
+        "glm" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
-        "qianfan" | "baidu" => "QIANFAN_API_KEY",
-        "zai" | "z.ai" => "ZAI_API_KEY",
+        "qwen" => "DASHSCOPE_API_KEY",
+        "qianfan" => "QIANFAN_API_KEY",
+        "zai" => "ZAI_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
         "opencode" | "opencode-zen" => "OPENCODE_API_KEY",
         "vercel" | "vercel-ai" => "VERCEL_API_KEY",
@@ -1870,6 +2006,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
         "gemini" => "GEMINI_API_KEY",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
+        "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",
     }
 }
@@ -2302,14 +2439,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
         telegram: None,
         discord: None,
         slack: None,
+        mattermost: None,
         webhook: None,
         imessage: None,
         matrix: None,
+        signal: None,
         whatsapp: None,
         email: None,
         irc: None,
         lark: None,
         dingtalk: None,
+        qq: None,
     };
 
     loop {
@@ -2383,7 +2523,15 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 if config.dingtalk.is_some() {
                     "✅ connected"
                 } else {
-                    "— 钉钉 Stream Mode"
+                    "— DingTalk Stream Mode"
+                }
+            ),
+            format!(
+                "QQ Official {}",
+                if config.qq.is_some() {
+                    "✅ connected"
+                } else {
+                    "— Tencent QQ Bot"
                 }
             ),
             "Done — finish setup".to_string(),
@@ -2392,7 +2540,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(9)
+            .default(10)
             .interact()?;
 
         match choice {
@@ -3110,7 +3258,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!(
                     "  {} {}",
                     style("DingTalk Setup").white().bold(),
-                    style("— 钉钉 Stream Mode").dim()
+                    style("— DingTalk Stream Mode").dim()
                 );
                 print_bullet("1. Go to DingTalk developer console (open.dingtalk.com)");
                 print_bullet("2. Create an app and enable the Stream Mode bot");
@@ -3174,6 +3322,82 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
+            9 => {
+                // ── QQ Official ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("QQ Official Setup").white().bold(),
+                    style("— Tencent QQ Bot SDK").dim()
+                );
+                print_bullet("1. Go to QQ Bot developer console (q.qq.com)");
+                print_bullet("2. Create a bot application");
+                print_bullet("3. Copy the App ID and App Secret");
+                println!();
+
+                let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
+
+                if app_id.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let app_secret: String =
+                    Input::new().with_prompt("  App Secret").interact_text()?;
+
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let client = reqwest::blocking::Client::new();
+                let body = serde_json::json!({
+                    "appId": app_id,
+                    "clientSecret": app_secret,
+                });
+                match client
+                    .post("https://bots.qq.com/app/getAppAccessToken")
+                    .json(&body)
+                    .send()
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let data: serde_json::Value = resp.json().unwrap_or_default();
+                        if data.get("access_token").is_some() {
+                            println!(
+                                "\r  {} QQ Bot credentials verified        ",
+                                style("✅").green().bold()
+                            );
+                        } else {
+                            println!(
+                                "\r  {} Auth error — check your credentials",
+                                style("❌").red().bold()
+                            );
+                            continue;
+                        }
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed user IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                config.qq = Some(QQConfig {
+                    app_id,
+                    app_secret,
+                    allowed_users,
+                });
+            }
             _ => break, // Done
         }
         println!();
@@ -3210,6 +3434,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.dingtalk.is_some() {
         active.push("DingTalk");
+    }
+    if config.qq.is_some() {
+        active.push("QQ");
     }
 
     println!(
@@ -3662,7 +3889,8 @@ fn print_summary(config: &Config) {
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some();
+        || config.channels_config.dingtalk.is_some()
+        || config.channels_config.qq.is_some();
 
     println!();
     println!(
@@ -4312,12 +4540,30 @@ mod tests {
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
         );
+        assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
+        assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
+        assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
+        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
+        assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
         assert_eq!(
             default_model_for_provider("google-gemini"),
             "gemini-2.5-pro"
         );
+    }
+
+    #[test]
+    fn canonical_provider_name_normalizes_regional_aliases() {
+        assert_eq!(canonical_provider_name("qwen-intl"), "qwen");
+        assert_eq!(canonical_provider_name("dashscope-us"), "qwen");
+        assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
+        assert_eq!(canonical_provider_name("kimi-cn"), "moonshot");
+        assert_eq!(canonical_provider_name("glm-cn"), "glm");
+        assert_eq!(canonical_provider_name("bigmodel"), "glm");
+        assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
+        assert_eq!(canonical_provider_name("zai-cn"), "zai");
+        assert_eq!(canonical_provider_name("z.ai-global"), "zai");
     }
 
     #[test]
@@ -4370,6 +4616,22 @@ mod tests {
         assert_eq!(
             curated_models_for_provider("gemini"),
             curated_models_for_provider("google-gemini")
+        );
+        assert_eq!(
+            curated_models_for_provider("qwen"),
+            curated_models_for_provider("qwen-intl")
+        );
+        assert_eq!(
+            curated_models_for_provider("qwen"),
+            curated_models_for_provider("dashscope-us")
+        );
+        assert_eq!(
+            curated_models_for_provider("minimax"),
+            curated_models_for_provider("minimax-cn")
+        );
+        assert_eq!(
+            curated_models_for_provider("zai"),
+            curated_models_for_provider("zai-cn")
         );
     }
 
@@ -4518,7 +4780,7 @@ mod tests {
         assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
-        assert_eq!(provider_env_var("ollama"), "API_KEY"); // fallback
+        assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
         assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
@@ -4526,9 +4788,17 @@ mod tests {
         assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("gemini"), "GEMINI_API_KEY");
+        assert_eq!(provider_env_var("qwen"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("qwen-intl"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
+        assert_eq!(provider_env_var("minimax-cn"), "MINIMAX_API_KEY");
+        assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
+        assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
+        assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
     }
 
     #[test]

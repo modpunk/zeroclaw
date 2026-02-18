@@ -38,6 +38,7 @@ use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod agent;
+mod approval;
 mod channels;
 mod rag {
     pub use zeroclaw::rag::*;
@@ -191,6 +192,9 @@ enum Commands {
         model_command: ModelCommands,
     },
 
+    /// List supported AI providers
+    Providers,
+
     /// Manage channels (telegram, discord, slack)
     Channel {
         #[command(subcommand)]
@@ -327,6 +331,11 @@ enum ChannelCommands {
     Remove {
         /// Channel name
         name: String,
+    },
+    /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    BindTelegram {
+        /// Telegram identity to allow (username without '@' or numeric user ID)
+        identity: String,
     },
 }
 
@@ -544,6 +553,39 @@ async fn main() -> Result<()> {
                 onboard::run_models_refresh(&config, provider.as_deref(), force)
             }
         },
+
+        Commands::Providers => {
+            let providers = providers::list_providers();
+            let current = config
+                .default_provider
+                .as_deref()
+                .unwrap_or("openrouter")
+                .trim()
+                .to_ascii_lowercase();
+            println!("Supported providers ({} total):\n", providers.len());
+            println!("  ID (use in config)  DESCRIPTION");
+            println!("  ─────────────────── ───────────");
+            for p in &providers {
+                let is_active = p.name.eq_ignore_ascii_case(&current)
+                    || p.aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(&current));
+                let marker = if is_active { " (active)" } else { "" };
+                let local_tag = if p.local { " [local]" } else { "" };
+                let aliases = if p.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (aliases: {})", p.aliases.join(", "))
+                };
+                println!(
+                    "  {:<19} {}{}{}{}",
+                    p.name, p.display_name, local_tag, marker, aliases
+                );
+            }
+            println!("\n  custom:<URL>   Any OpenAI-compatible endpoint");
+            println!("  anthropic-custom:<URL>  Any Anthropic-compatible endpoint");
+            Ok(())
+        }
 
         Commands::Service { service_command } => service::handle_command(&service_command, &config),
 

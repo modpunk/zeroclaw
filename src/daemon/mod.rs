@@ -214,9 +214,12 @@ fn has_supervised_channels(config: &Config) -> bool {
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
+        || config.channels_config.signal.is_some()
         || config.channels_config.whatsapp.is_some()
         || config.channels_config.email.is_some()
+        || config.channels_config.irc.is_some()
         || config.channels_config.lark.is_some()
+        || config.channels_config.dingtalk.is_some()
 }
 
 #[cfg(test)]
@@ -293,6 +296,17 @@ mod tests {
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec![],
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_dingtalk_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "client_id".into(),
+            client_secret: "client_secret".into(),
+            allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
     }
