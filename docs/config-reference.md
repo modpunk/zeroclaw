@@ -50,6 +50,36 @@ Notes:
 - Setting `max_tool_iterations = 0` falls back to safe default `10`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 
+## `[runtime]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `reasoning_enabled` | unset (`None`) | Global reasoning/thinking override for providers that support explicit controls |
+
+Notes:
+
+- `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
+- `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
+- Unset keeps provider defaults.
+
+## `[multimodal]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_images` | `4` | Maximum image markers accepted per request |
+| `max_image_size_mb` | `5` | Per-image size limit before base64 encoding |
+| `allow_remote_fetch` | `false` | Allow fetching `http(s)` image URLs from markers |
+
+Notes:
+
+- Runtime accepts image markers in user messages with syntax: ``[IMAGE:<source>]``.
+- Supported sources:
+  - Local file path (for example ``[IMAGE:/tmp/screenshot.png]``)
+- Data URI (for example ``[IMAGE:data:image/png;base64,...]``)
+- Remote URL only when `allow_remote_fetch = true`
+- Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
+- When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
@@ -87,8 +117,36 @@ Notes:
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
 | `auto_save` | `true` | automatic persistence |
 | `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
+| `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
+| `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
 | `vector_weight` | `0.7` | hybrid ranking vector weight |
 | `keyword_weight` | `0.3` | hybrid ranking keyword weight |
+
+## `[[model_routes]]` and `[[embedding_routes]]`
+
+Use route hints so integrations can keep stable names while model IDs evolve.
+
+```toml
+[memory]
+embedding_model = "hint:semantic"
+
+[[model_routes]]
+hint = "reasoning"
+provider = "openrouter"
+model = "provider/model-id"
+
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+dimensions = 1536
+```
+
+Upgrade strategy:
+
+1. Keep hints stable (`hint:reasoning`, `hint:semantic`).
+2. Update only `model = "...new-version..."` in the route entries.
+3. Validate with `zeroclaw doctor` before restart/rollout.
 
 ## `[channels_config]`
 

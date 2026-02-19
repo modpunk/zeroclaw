@@ -6,6 +6,7 @@ pub mod imessage;
 pub mod irc;
 pub mod lark;
 pub mod linq;
+#[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
 pub mod qq;
@@ -27,6 +28,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use linq::LinqChannel;
+#[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
 pub use qq::QQChannel;
@@ -78,6 +80,11 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
+const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
+const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
+const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
+const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
+const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -134,6 +141,7 @@ struct ChannelRuntimeContext {
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
     message_timeout_secs: u64,
+    multimodal: crate::config::MultimodalConfig,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -252,6 +260,44 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
+}
+
+fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return false;
+    };
+
+    if turns.is_empty() {
+        return false;
+    }
+
+    let keep_from = turns
+        .len()
+        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+    let mut compacted = turns[keep_from..].to_vec();
+
+    for turn in &mut compacted {
+        if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
+            turn.content =
+                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+        }
+    }
+
+    *turns = compacted;
+    true
+}
+
+fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
+    if key.trim().to_ascii_lowercase().ends_with("_history") {
+        return true;
+    }
+
+    content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
@@ -478,19 +524,43 @@ async fn build_memory_context(
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true, // keep entries without a score (e.g. non-vector backends)
-            })
-            .collect();
+        let mut included = 0usize;
+        let mut used_chars = 0usize;
 
-        if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &relevant {
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+        for entry in entries.iter().filter(|e| match e.score {
+            Some(score) => score >= min_relevance_score,
+            None => true, // keep entries without a score (e.g. non-vector backends)
+        }) {
+            if included >= MEMORY_CONTEXT_MAX_ENTRIES {
+                break;
             }
+
+            if should_skip_memory_context_entry(&entry.key, &entry.content) {
+                continue;
+            }
+
+            let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
+                truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
+            } else {
+                entry.content.clone()
+            };
+
+            let line = format!("- {}: {}\n", entry.key, content);
+            let line_chars = line.chars().count();
+            if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
+                break;
+            }
+
+            if included == 0 {
+                context.push_str("[Memory context]\n");
+            }
+
+            context.push_str(&line);
+            used_chars += line_chars;
+            included += 1;
+        }
+
+        if included > 0 {
             context.push('\n');
         }
     }
@@ -743,6 +813,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             true,
             None,
             msg.channel.as_str(),
+            &ctx.multimodal,
             ctx.max_tool_iterations,
             delta_tx,
         ),
@@ -809,11 +880,16 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         }
         Ok(Err(e)) => {
             if is_context_window_overflow_error(&e) {
-                clear_sender_history(ctx.as_ref(), &history_key);
-                let error_text = "⚠️ Context window exceeded for this conversation. I cleared this sender history. Please resend your last message.";
+                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                let error_text = if compacted {
+                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                } else {
+                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
+                };
                 eprintln!(
-                    "  ⚠️ Context window exceeded after {}ms; sender history cleared",
-                    started_at.elapsed().as_millis()
+                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
+                    started_at.elapsed().as_millis(),
+                    compacted
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
@@ -1315,7 +1391,10 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("Mattermost", config.channels_config.mattermost.is_some()),
                 ("Webhook", config.channels_config.webhook.is_some()),
                 ("iMessage", config.channels_config.imessage.is_some()),
-                ("Matrix", config.channels_config.matrix.is_some()),
+                (
+                    "Matrix",
+                    cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
+                ),
                 ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Linq", config.channels_config.linq.is_some()),
@@ -1326,6 +1405,11 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("QQ", config.channels_config.qq.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
+            }
+            if !cfg!(feature = "channel-matrix") {
+                println!(
+                    "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
+                );
             }
             println!("\nTo start channels: zeroclaw channel start");
             println!("To check health:    zeroclaw channel doctor");
@@ -1415,6 +1499,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    #[cfg(feature = "channel-matrix")]
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push((
             "Matrix",
@@ -1427,6 +1512,13 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 mx.device_id.clone(),
             )),
         ));
+    }
+
+    #[cfg(not(feature = "channel-matrix"))]
+    if config.channels_config.matrix.is_some() {
+        tracing::warn!(
+            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix health check."
+        );
     }
 
     if let Some(ref sig) = config.channels_config.signal {
@@ -1600,6 +1692,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auth_profile_override: None,
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
     };
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         &provider_name,
@@ -1799,6 +1892,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
     }
 
+    #[cfg(feature = "channel-matrix")]
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(Arc::new(MatrixChannel::new_with_session_hint(
             mx.homeserver.clone(),
@@ -1808,6 +1902,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
             mx.user_id.clone(),
             mx.device_id.clone(),
         )));
+    }
+
+    #[cfg(not(feature = "channel-matrix"))]
+    if config.channels_config.matrix.is_some() {
+        tracing::warn!(
+            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix runtime startup."
+        );
     }
 
     if let Some(ref sig) = config.channels_config.signal {
@@ -1999,6 +2100,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
         message_timeout_secs,
+        multimodal: config.multimodal.clone(),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -2067,6 +2169,91 @@ mod tests {
         let other_err =
             anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
         assert!(!is_context_window_overflow_error(&other_err));
+    }
+
+    #[test]
+    fn memory_context_skip_rules_exclude_history_blobs() {
+        assert!(should_skip_memory_context_entry(
+            "telegram_123_history",
+            r#"[{"role":"user"}]"#
+        ));
+        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
+    }
+
+    #[test]
+    fn compact_sender_history_keeps_recent_truncated_messages() {
+        let mut histories = HashMap::new();
+        let sender = "telegram_u1".to_string();
+        histories.insert(
+            sender.clone(),
+            (0..20)
+                .map(|idx| {
+                    let content = format!("msg-{idx}-{}", "x".repeat(700));
+                    if idx % 2 == 0 {
+                        ChatMessage::user(content)
+                    } else {
+                        ChatMessage::assistant(content)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        };
+
+        assert!(compact_sender_history(&ctx, &sender));
+
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let kept = histories
+            .get(&sender)
+            .expect("sender history should remain");
+        assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+        assert!(kept.iter().all(|turn| {
+            let len = turn.content.chars().count();
+            len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
+                || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
+                    && turn.content.ends_with("..."))
+        }));
+    }
+
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for DummyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
     }
 
     #[derive(Default)]
@@ -2415,6 +2602,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
@@ -2469,6 +2657,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
@@ -2532,6 +2721,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
@@ -2616,6 +2806,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
@@ -2676,6 +2867,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
@@ -2731,6 +2923,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
@@ -2837,6 +3030,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2910,6 +3104,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
@@ -3307,6 +3502,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
         });
 
         process_channel_message(
