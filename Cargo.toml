@@ -111,7 +111,7 @@ which = "7.0"
 
 # WebSocket client channels (Discord/Lark/DingTalk)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"
